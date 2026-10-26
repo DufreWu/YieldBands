@@ -30,6 +30,12 @@ def valid_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"\d{6}", str(symbol)))
 
 
+def sina_symbol(symbol: str) -> str:
+    """Sina wants an exchange prefix: 6/9 → Shanghai, 4/8 → Beijing, otherwise Shenzhen."""
+    prefix = "sh" if symbol[0] in "69" else "bj" if symbol[0] in "48" else "sz"
+    return prefix + symbol
+
+
 def _get_column(df: pd.DataFrame, choices: tuple[str, ...], *, required=True) -> str | None:
     for name in choices:
         if name in df.columns:
@@ -112,8 +118,49 @@ def normalize_dividends(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     return frame, warns
 
 
+def finalize(prices: pd.DataFrame, dividends: pd.DataFrame) -> StockData:
+    """Validate a price/dividend pair and attach data-quality warnings."""
+    # Only keep ex-dates up to the end of returned data; announced future corporate
+    # actions cannot participate in backtests.
+    dividends = dividends[dividends.ex_date <= prices.date.max()].reset_index(drop=True)
+    if dividends.empty:
+        raise DataSourceError("当前行情时间段内没有可用的已实施分红历史。")
+    warnings = []
+    if dividends.ex_date.duplicated().any():
+        warnings.append("发现同日多条权益事件；请核实是否重复，分红已逐笔处理。")
+    if len(prices) < 100:
+        warnings.append("获取到的行情少于100个交易日，回测可能无法生成信号。")
+    if not set(dividends.ex_date).intersection(set(prices.date)):
+        warnings.append("下载的价格区间内没有除息日；请检查股息率历史窗口或扩大范围。")
+    return StockData(prices=prices, dividends=dividends, warnings=warnings)
+
+
 class AkshareProvider:
     """Provider boundary: replace this class to add more data sources."""
+
+    def profile(self, symbol: str) -> dict[str, str]:
+        """Best-effort name / industry lookup (Eastmoney, then cninfo); {} if both fail."""
+        try:
+            import akshare as ak
+        except ImportError:
+            return {}
+        sources = (
+            (lambda: ak.stock_individual_info_em(symbol=symbol), "股票简称", "行业"),
+            (lambda: ak.stock_profile_cninfo(symbol=symbol), "A股简称", "所属行业"),
+        )
+        for load, name_col, industry_col in sources:
+            try:
+                info = load()
+                if name_col not in info.columns:  # Eastmoney returns item/value rows
+                    info = pd.DataFrame([dict(zip(info.iloc[:, 0].astype(str), info.iloc[:, 1]))])
+                row = info.iloc[0]
+            except Exception:
+                continue
+            found = {key: str(row[col]).strip() for key, col in (("name", name_col), ("industry", industry_col))
+                     if col in row.index and str(row[col]).strip() not in ("", "-", "nan", "None")}
+            if found:
+                return found
+        return {}
 
     def fetch(self, symbol: str, start_date: date, end_date: date) -> StockData:
         if not valid_symbol(symbol):
@@ -125,10 +172,16 @@ class AkshareProvider:
         params = dict(symbol=symbol, period="daily", start_date=start_date.strftime("%Y%m%d"),
                       end_date=end_date.strftime("%Y%m%d"))
         try:
-            raw = ak.stock_zh_a_hist(**params, adjust="")
-            hfq = ak.stock_zh_a_hist(**params, adjust="hfq")
-        except Exception as exc:
-            raise DataSourceError(f"股票行情抓取失败：{str(exc)[:220]}") from exc
+            raw = ak.stock_zh_a_hist(**params, adjust="", timeout=15)
+            hfq = ak.stock_zh_a_hist(**params, adjust="hfq", timeout=15)
+        except Exception as em_exc:
+            # Eastmoney often refuses connections (e.g. outside mainland China); Sina is the fallback.
+            sina = dict(symbol=sina_symbol(symbol), start_date=params["start_date"], end_date=params["end_date"])
+            try:
+                raw = ak.stock_zh_a_daily(**sina, adjust="")
+                hfq = ak.stock_zh_a_daily(**sina, adjust="hfq")
+            except Exception as exc:
+                raise DataSourceError(f"股票行情抓取失败：东方财富 {str(em_exc)[:120]}；新浪 {str(exc)[:120]}") from exc
         prices = normalize_price(raw, hfq)
         dividend_fn = ak.stock_history_dividend_detail
         # Some versions of AKShare use stock=, others use symbol=.
@@ -141,14 +194,5 @@ class AkshareProvider:
             raw_div = dividend_fn(**kwargs)
         except Exception as exc:
             raise DataSourceError(f"分红历史抓取失败：{str(exc)[:220]}") from exc
-        dividends, warnings = normalize_dividends(raw_div)
-        # Only keep ex-dates up to the end of returned data; announced future corporate
-        # actions cannot participate in backtests.
-        dividends = dividends[dividends.ex_date <= prices.date.max()].copy()
-        if dividends.empty:
-            raise DataSourceError("当前行情时间段内没有可用的已实施分红历史。")
-        if len(prices) < 100:
-            warnings.append("获取到的行情少于100个交易日，回测可能无法生成信号。")
-        if not set(dividends.ex_date).intersection(set(prices.date)):
-            warnings.append("下载的价格区间内没有除息日；请检查股息率历史窗口或扩大范围。")
-        return StockData(prices=prices, dividends=dividends.reset_index(drop=True), warnings=warnings)
+        dividends, _ = normalize_dividends(raw_div)
+        return finalize(prices, dividends)

@@ -1,40 +1,80 @@
 # YieldBands — 股息率 × Bollinger Bands
 
-一个可在本机浏览器运行的 A 股历史股息率、周线布林带、买卖信号和回测 Demo。
+一个可在本机浏览器运行的 A 股历史股息率、布林带、买卖信号、回测和股息率观察工具。
 
-**默认支持**：招商银行 `600036`、长江电力 `600900`。支持任意合法的 A 股6位代码；代码展示名称表在 `yieldbands/catalog.py`，行情提供者在 `yieldbands/data.py`，策略在 `yieldbands/engine.py`。
+**默认股票**：招商银行 `600036`、长江电力 `600900`、国电电力 `600795`、海尔智家 `600690`、中国平安 `601318`（见 `yieldbands/catalog.py`）。也支持任意合法的 A 股6位代码。
 
-## 运行（Python 3.10+）
+## 运行（Python 3.10+，Streamlit 1.46+）
 
 ```bash
-# 1. 解压本项目并进入目录
-cd yieldbands
+# 1. 进入项目目录
+cd YieldBands
 
 # 2. 创建独立 Python 环境
 python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
-# Windows PowerShell： .venv\\Scripts\\Activate.ps1
+# Windows PowerShell： .venv\Scripts\Activate.ps1
 
 # 3. 安装依赖
 pip install -r requirements.txt
 
-# 4. 在浏览器打开本地应用
+# 4. 首次运行：联网下载数据并保存到本地 data/ 目录
+streamlit run app.py -- --update-data
+
+# 5. 之后正常运行：只读本地数据，不联网
 streamlit run app.py
 ```
 
-启动后浏览器默认打开 `http://localhost:8501`。需要网络才能调用 AKShare 所连接的公开行情和分红服务；无法联网时会显示错误，不会自动编造历史行情。第一次下载较慢，数据缓存6小时，可手动刷新。
+启动后浏览器默认打开 `http://localhost:8501`。
 
-## UI 控件
+## 本地数据与更新
+
+- **正常运行**（`streamlit run app.py`）只读取本地 `data/<代码>/` 下的文件，不访问网络。本地没有的股票会提示先下载。
+- **更新数据**（`streamlit run app.py -- --update-data`）：每只用到的股票，在本次启动中下载一次**完整历史**并覆盖本地文件，之后切换页面、调整参数都用本地副本；下载失败时继续使用已有的本地数据并给出提示。
+- `--update-data` 前面的 `--` 不能省略，它把参数传给 app 而不是 streamlit。
+- 只有在页面中实际用到的股票才会下载：想更新哪些股票，就在更新模式下打开它们（例如在「股息率观察」里列出全部代码）。
+- 页面上会显示本地数据的下载时间。`data/` 已加入 `.gitignore`。
+
+```text
+data/600036/
+├── prices.csv       # 日线：不复权开盘/收盘、成交量、后复权收盘
+├── dividends.csv    # 已实施分红与送转股（每股口径）
+└── profile.json     # 名称、行业
+```
+
+## 页面
+
+顶部导航栏有两个页面。
+
+### 个股分析
+
+单只股票的历史股息率、周线布林带、买卖信号和回测。左侧栏控件：
 
 | 分类 | 可调整项 |
 | --- | --- |
-| 股票 | 招商银行、长江电力，或输入任意6位代码 |
+| 股票 | `catalog.py` 中的股票，或输入任意6位代码 |
 | 范围 | 回测起止日期 |
 | 策略 | 价格Boll + 股息过滤（默认）；股息率Boll；股息率X年均线；纯价格Boll |
 | 指标 | 股息率均线X年、Boll周期（周）、标准差倍数 |
 | 回测 | 初始资金、单边佣金、卖出印花税、滑点 |
 | 输出 | 股价与股息图、策略 vs 买入持有净值图、最大回撤、交易与分红明细、CSV下载 |
+
+### 股息率观察
+
+输入一组代码（空格或逗号分隔，默认为 `catalog.py` 中的股票），以卡片形式按 TTM 股息率降序列出，可选分位窗口近3/5/10年。每只股票显示：
+
+| 项目 | 口径 |
+| --- | --- |
+| 现价 / 涨跌幅 | 最新交易日不复权收盘价；涨跌幅按后复权价计算，避免除息日失真（红涨绿跌） |
+| TTM股息率 | 过去365天已实施现金分红 ÷ 现价（与个股分析相同口径） |
+| 静态 | 上一自然年除息的已实施分红 ÷ 现价（按自然年而非财报年度归属） |
+| 股息率分位 | 当前 TTM 股息率在近N年日度序列中的百分位；≥80% 高位，≤20% 低位 |
+| BOLL | 后复权价在日 / 周 / 月线 Boll(20, 2σ) 中的位置：上、中上、中、中下、下 |
+| ⭐ 信号 | 默认策略（价格Boll + 3年股息率过滤）本周出现买入或卖出信号 |
+| 股息率价格区间 | 按当前 TTM 分红，股息率达到相邻两档（0.5% 步长，如 8% / 8.5%）所需的股价 |
+
+计算逻辑在 `yieldbands/watch.py`。
 
 ## 策略说明（默认）
 
@@ -50,39 +90,48 @@ streamlit run app.py
 
 ## 数据源与准确性
 
-- **价格**：AKShare `stock_zh_a_hist(..., adjust="")`（真实成交估值与股息率）； `stock_zh_a_hist(..., adjust="hfq")`（技术图表及信号）。
-- **已实施派息与送转股**：AKShare `stock_history_dividend_detail(..., indicator="分红")`，通常来自新浪财经“发行与分配”。该来源的 `派息(税前)(元)` 按**每10股**计价，代码除以10转化每股。未实施或没有除权除息日的预案一律不计。
+- **价格**：先用 AKShare `stock_zh_a_hist`（东方财富）；连接失败时（大陆以外网络常见）自动改用 `stock_zh_a_daily`（新浪）。不复权价用于成交和股息率，后复权价用于技术指标和信号。
+- **已实施派息与送转股**：AKShare `stock_history_dividend_detail(..., indicator="分红")`，来自新浪财经“发行与分配”。该来源的派息按**每10股**计价，代码除以10转化每股。未实施或没有除权除息日的预案一律不计。
+- **名称与行业**：先用东方财富 `stock_individual_info_em`，失败时改用巨潮资讯 `stock_profile_cninfo`；都失败时只显示代码。
 - **除息日会计简化**：为了模拟总收益，持有在除息日的税前现金分红在当日记入现金；实际现金到账日可能稍后，也不模拟分红税、送转股尾数处理及复杂配股。
 - **费用**：静态佣金、滑点、卖出印花税（可调整），不做分段历史税制；默认单边佣金0.03%、印花税0.05%、单边滑点5 bps。
 - **潜在偏差**：后复权历史价格随最新复权因子回算；常规布林带相对位置通常不受未来的统一倍数影响，但因数据修正、公司送配股、历史股本变化可能产生细微差别。
-- **缺失数据**：真实数据下载失败或日期缺失会显式报错/提醒，不用示例价格替代。做投资决策前请交叉核验原始分红公告和交易所披露。
+- **缺失数据**：真实数据下载失败或日期缺失会显式报错/提醒，不用示例价格替代。新浪接口访问过于频繁可能被临时限流。做投资决策前请交叉核验原始分红公告和交易所披露。
 
 本软件仅供研究和策略原型验证，不构成任何投资建议。
 
 ## 文件结构
 
 ```text
-yieldbands/
-├── app.py                    # Streamlit交互网页
+YieldBands/
+├── app.py                   # Streamlit 网页：顶部导航、个股分析、股息率观察
 ├── requirements.txt
 ├── README.md
+├── assets/                  # 示例图片
+├── data/                    # 本地数据（--update-data 生成，不提交）
 ├── yieldbands/
-│   ├── catalog.py           # 股票代码与名称（可扩展）
-│   ├── data.py              # AkshareProvider / 数据校验与规范化
-│   └── engine.py            # 现金股息TTM、周线技术指标、交易回测
+│   ├── catalog.py           # 默认股票代码与名称（可扩展）
+│   ├── data.py              # AkshareProvider：下载、数据校验与规范化
+│   ├── store.py             # LocalStore：本地 CSV 保存与读取
+│   ├── engine.py            # 现金股息TTM、周线技术指标、交易回测
+│   └── watch.py             # 股息率观察的单股快照指标
 └── tests/
-    └── test_engine.py       # 关键逻辑的离线单元测试
+    ├── test_engine.py       # 分红单位、送转、无未来数据、成交时点
+    ├── test_store.py        # 本地数据保存、按日期切片
+    └── test_watch.py        # Boll 位置、价格区间、静态股息率、分位
 ```
 
-## 添加第三只股票
+## 添加股票
 
-只需要更新 `yieldbands/catalog.py`：
+更新 `yieldbands/catalog.py`：
 
 ```python
 STOCKS["600519"] = "贵州茅台"
 ```
 
-或直接在网页勾选“自定义 A 股代码”，填入 `600519`。若需要更换来源（如 Tushare），可以新建 Provider，实现 `fetch(symbol, start_date, end_date) -> StockData`，复用现有 `normalize_price`、`normalize_dividends`、`build_daily`、`build_weekly` 和 `backtest`。
+或直接在「个股分析」选择“自定义 A 股代码”、在「股息率观察」输入框中加入代码。**新股票需先用 `--update-data` 启动并打开一次**，下载到本地后才能正常运行使用。
+
+若需要更换来源（如 Tushare），可以新建 Provider，实现 `fetch(symbol, start_date, end_date) -> StockData` 和 `profile(symbol) -> dict`，交给 `LocalStore.update` 使用，并复用现有 `normalize_price`、`normalize_dividends`、`build_daily`、`build_weekly` 和 `backtest`。
 
 ## 本地测试（不需要连接行情接口）
 
@@ -91,4 +140,4 @@ pip install pytest
 pytest -q
 ```
 
-测试使用人工构造数据验证分红单位、送转股、无未来数据泄漏、周五信号次交易日开盘执行和买在除息日没有上一期分红资格等关键条件。**这不等于已经完成真实市场数据端到端测试**。
+测试使用人工构造数据验证分红单位、送转股、无未来数据泄漏、周五信号次交易日开盘执行、买在除息日没有上一期分红资格、本地数据读写，以及股息率观察的各项指标。**这不等于已经完成真实市场数据端到端测试**。
