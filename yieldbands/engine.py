@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from math import floor
+import operator
 
 import numpy as np
 import pandas as pd
@@ -18,7 +19,51 @@ STRATEGIES = {
     "yield_bb": "股息率周线上轨买 / 下轨卖 + 高于X年平均股息率过滤",
     "yield_mean": "股息率上穿X年均线买 / 下穿均线卖",
     "price_bb": "纯价格周线下轨买 / 上轨卖（对照）",
+    "grid": "网格：股息率分档 + 周线Boll 分批买卖",
 }
+
+# Weekly Boll condition of a grid rule: weekly (adjusted) close compared with a band.
+BOLL_CONDITIONS = {
+    "不限": None,
+    "≤下轨": ("price_lower", operator.le),
+    "≤中轨": ("price_mid", operator.le),
+    "≥中轨": ("price_mid", operator.ge),
+    "≥上轨": ("price_upper", operator.ge),
+}
+
+
+@dataclass(frozen=True)
+class GridRule:
+    """BUY: yield ≥ yield_pct and Boll condition → invest size_pct % of initial cash (once per level).
+    SELL: yield ≤ yield_pct and Boll condition → sell size_pct % of current holdings."""
+    action: str
+    yield_pct: float
+    boll: str = "不限"
+    size_pct: float = 100.0
+
+    def label(self) -> str:
+        sign = "≥" if self.action == "BUY" else "≤"
+        boll = "" if self.boll == "不限" else f" 周{self.boll}"
+        return f"{'买' if self.action == 'BUY' else '卖'} 股息率{sign}{self.yield_pct:g}%{boll}"
+
+    def hit(self, row) -> bool:
+        if pd.isna(row["yield_pct"]):
+            return False
+        y = row["yield_pct"]
+        if not (y >= self.yield_pct if self.action == "BUY" else y <= self.yield_pct):
+            return False
+        band = BOLL_CONDITIONS[self.boll]
+        if band is None:
+            return True
+        column, op = band
+        return bool(pd.notna(row[column]) and op(row["price"], row[column]))
+
+
+DEFAULT_GRID = (
+    GridRule("BUY", 5.0, "≤下轨", 50.0),
+    GridRule("BUY", 5.5, "≤下轨", 50.0),
+    GridRule("SELL", 4.5, "≥上轨", 100.0),
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +77,7 @@ class Settings:
     stamp_tax: float = 0.0005
     slippage: float = 0.0005
     lot_size: int = 100
+    grid: tuple[GridRule, ...] = DEFAULT_GRID
 
 
 @dataclass
@@ -102,7 +148,14 @@ def build_weekly(daily: pd.DataFrame, settings: Settings) -> pd.DataFrame:
         weekly[f"{name}_mid"] = avg
         weekly[f"{name}_upper"] = avg + sigma * std
         weekly[f"{name}_lower"] = avg - sigma * std
-    setups = [conditions(row, settings.strategy) for _, row in weekly.iterrows()]
+    if settings.strategy == "grid":
+        if not any(rule.action == "BUY" for rule in settings.grid):
+            raise ValueError("网格策略至少需要一条买入规则。")
+        setups = [(any(r.hit(row) for r in settings.grid if r.action == "BUY"),
+                   any(r.hit(row) for r in settings.grid if r.action == "SELL"))
+                  for _, row in weekly.iterrows()]
+    else:
+        setups = [conditions(row, settings.strategy) for _, row in weekly.iterrows()]
     weekly["buy_setup"] = [item[0] for item in setups]
     weekly["sell_setup"] = [item[1] for item in setups]
     return weekly
@@ -163,6 +216,35 @@ def _mdd(series: pd.Series) -> float:
     return float((series / series.cummax() - 1).min() * 100)
 
 
+def _orders(row, date: pd.Timestamp, settings: Settings, tranches: list[list]):
+    """Orders decided at a weekly close, executed at the next session's open."""
+    held = sum(t[1] for t in tranches) > 1e-9
+    if settings.strategy != "grid":
+        buy, sell = conditions(row, settings.strategy)
+        if not held and buy:
+            return [("BUY", date, None)]
+        if held and sell:
+            return [("SELL", date, None)]
+        return []
+    rules = list(enumerate(settings.grid))
+    sells = [(r.size_pct, i) for i, r in rules if r.action == "SELL" and r.hit(row)]
+    if held and sells:
+        return [("SELL", date, max(sells)[1])]  # the largest matching sell wins; no buys that week
+    # A buy level fires once, then waits until its own tranche has been sold.
+    occupied = {t[0] for t in tranches}
+    return [("BUY", date, i) for i, r in rules if r.action == "BUY" and i not in occupied and r.hit(row)]
+
+
+def _remove_latest(tranches: list[list], qty: float) -> None:
+    """Sell the most recently bought tranches first; a fully sold tranche frees its level."""
+    while qty > 1e-9 and tranches:
+        take = min(qty, tranches[-1][1])
+        tranches[-1][1] -= take
+        qty -= take
+        if tranches[-1][1] <= 1e-9:
+            tranches.pop()
+
+
 def backtest(daily: pd.DataFrame, weekly: pd.DataFrame, dividends: pd.DataFrame,
              start_date, end_date, settings: Settings) -> Backtest:
     """Signals at weekly close, execute *next trading day's open*.
@@ -184,8 +266,10 @@ def backtest(daily: pd.DataFrame, weekly: pd.DataFrame, dividends: pd.DataFrame,
         if start <= ev.ex_date <= end:
             event_by_day.setdefault(pd.Timestamp(ev.ex_date), []).append(ev)
     cash = bench_cash = float(settings.initial_cash)
-    shares = bench_shares = 0.0
-    pending: tuple[str, pd.Timestamp] | None = None
+    bench_shares = 0.0
+    # Open positions as [grid rule index (None for all-in strategies), shares], oldest first.
+    tranches: list[list] = []
+    pending: list[tuple[str, pd.Timestamp, int | None]] = []
     trades = []
     paid = []
     history = []
@@ -194,7 +278,7 @@ def backtest(daily: pd.DataFrame, weekly: pd.DataFrame, dividends: pd.DataFrame,
         # Entitlement is decided on record date before the ex-date. The order
         # executed at ex-date open must not receive this distribution.
         for ev in event_by_day.get(date, []):
-            for label, held in (("strategy", shares), ("benchmark", bench_shares)):
+            for label, held in (("strategy", sum(t[1] for t in tranches)), ("benchmark", bench_shares)):
                 cash_amt = held * float(ev.cash_per_old_share)
                 if cash_amt > 1e-8:
                     paid.append({"date": date, "account": label, "shares_before": held,
@@ -203,35 +287,42 @@ def backtest(daily: pd.DataFrame, weekly: pd.DataFrame, dividends: pd.DataFrame,
                     cash += cash_amt
                 else:
                     bench_cash += cash_amt
-            shares *= float(ev.split_factor)
+            for tranche in tranches:
+                tranche[1] *= float(ev.split_factor)
             bench_shares *= float(ev.split_factor)
         if i == 0:
             qty, bench_cash, _, _ = _buy(bench_cash, float(row.open), settings)
             bench_shares = float(qty)
-        if pending:
-            action, signal_date = pending
-            if action == "BUY" and shares < 1e-9:
-                qty, new_cash, fee, exec_px = _buy(cash, float(row.open), settings)
-                if qty:
-                    cash, shares = new_cash, float(qty)
-                    trades.append({"signal_date": signal_date, "date": date, "action": "BUY",
-                                   "price": exec_px, "shares": float(qty), "fee": fee, "cash_after": cash})
-            elif action == "SELL" and shares > 1e-9:
-                sold = shares
-                cash, fee, exec_px = _sell(cash, shares, float(row.open), settings)
-                shares = 0.0
-                trades.append({"signal_date": signal_date, "date": date, "action": "SELL",
-                               "price": exec_px, "shares": sold, "fee": fee, "cash_after": cash})
-            pending = None
+        for action, signal_date, idx in pending:
+            rule = settings.grid[idx] if idx is not None else None
+            label = rule.label() if rule else STRATEGIES[settings.strategy]
+            if action == "BUY":
+                budget = cash if rule is None else min(cash, settings.initial_cash * rule.size_pct / 100)
+                qty, left, fee, exec_px = _buy(budget, float(row.open), settings)
+                if not qty:
+                    continue
+                cash -= budget - left
+                tranches.append([idx, float(qty)])
+            else:
+                held = sum(t[1] for t in tranches)
+                if rule is None or rule.size_pct >= 100:
+                    qty = held
+                else:
+                    qty = floor(held * rule.size_pct / 100 / settings.lot_size) * settings.lot_size
+                if qty <= 1e-9:
+                    continue
+                cash, fee, exec_px = _sell(cash, qty, float(row.open), settings)
+                _remove_latest(tranches, qty)
+            trades.append({"signal_date": signal_date, "date": date, "action": action, "rule": label,
+                           "price": exec_px, "shares": float(qty), "fee": fee, "cash_after": cash,
+                           "shares_after": sum(t[1] for t in tranches)})
+        pending = []
+        shares = sum(t[1] for t in tranches)
         history.append({"date": date, "equity": cash + shares * float(row.close),
                         "benchmark_equity": bench_cash + bench_shares * float(row.close),
                         "cash": cash, "shares": shares, "close": float(row.close)})
         if date in week_by_date:
-            buy_signal, sell_signal = conditions(week_by_date[date], settings.strategy)
-            if shares < 1e-9 and buy_signal:
-                pending = ("BUY", date)
-            elif shares > 1e-9 and sell_signal:
-                pending = ("SELL", date)
+            pending = _orders(week_by_date[date], date, settings, tranches)
     portfolio = pd.DataFrame(history)
     portfolio["strategy_return_pct"] = (portfolio.equity / settings.initial_cash - 1) * 100
     portfolio["benchmark_return_pct"] = (portfolio.benchmark_equity / settings.initial_cash - 1) * 100

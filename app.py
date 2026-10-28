@@ -15,7 +15,8 @@ import streamlit as st
 from yieldbands.catalog import STOCKS, display_options
 from yieldbands.data import AkshareProvider, DataSourceError, StockData, valid_symbol
 from yieldbands.store import LocalStore
-from yieldbands.engine import STRATEGIES, Settings, backtest, build_daily, build_weekly
+from yieldbands.engine import (BOLL_CONDITIONS, DEFAULT_GRID, STRATEGIES, GridRule, Settings,
+                               backtest, build_daily, build_weekly)
 from yieldbands.watch import snapshot
 
 st.set_page_config(page_title="YieldBands | 股息率 × 布林带", page_icon="📈", layout="wide")
@@ -58,7 +59,33 @@ def data_status(codes: list[str]) -> str:
     return f"本地数据下载于 {min(times):%Y-%m-%d %H:%M}。{mode}"
 
 
-def display_chart(daily: pd.DataFrame, weekly: pd.DataFrame, trades: pd.DataFrame, start: date, end: date):
+GRID_ACTIONS = {"买": "BUY", "卖": "SELL"}
+
+
+def grid_editor() -> tuple[GridRule, ...]:
+    st.caption("**买**：股息率 ≥ 阈值且满足周线条件 → 投入初始资金的「仓位%」，每档在卖出前只买一次。"
+               "**卖**：股息率 ≤ 阈值且满足周线条件 → 卖出当前持仓的「仓位%」，先卖最近买入的档。")
+    default = pd.DataFrame([{"动作": "买" if r.action == "BUY" else "卖", "股息率%": r.yield_pct,
+                             "周线": r.boll, "仓位%": r.size_pct} for r in DEFAULT_GRID])
+    table = st.data_editor(default, key="grid_rules", num_rows="dynamic", hide_index=True, use_container_width=True,
+                           column_config={
+                               "动作": st.column_config.SelectboxColumn(options=list(GRID_ACTIONS), required=True),
+                               "股息率%": st.column_config.NumberColumn(min_value=0.1, max_value=30.0, step=0.1,
+                                                                     format="%.1f", required=True),
+                               "周线": st.column_config.SelectboxColumn(options=list(BOLL_CONDITIONS), required=True),
+                               "仓位%": st.column_config.NumberColumn(min_value=1, max_value=100, step=5,
+                                                                    format="%d", required=True),
+                           })
+    rules = tuple(GridRule(GRID_ACTIONS[r["动作"]], float(r["股息率%"]), r["周线"], float(r["仓位%"]))
+                  for r in table.to_dict("records") if all(pd.notna(v) for v in r.values()))
+    buy_total = sum(r.size_pct for r in rules if r.action == "BUY")
+    if buy_total > 100:
+        st.warning(f"买入档合计 {buy_total:g}% 超过100%，资金不足时后面的档按剩余现金买入。")
+    return rules
+
+
+def display_chart(daily: pd.DataFrame, weekly: pd.DataFrame, trades: pd.DataFrame, start: date, end: date,
+                  grid: tuple[GridRule, ...] = ()):
     w = weekly[(weekly.date >= pd.Timestamp(start)) & (weekly.date <= pd.Timestamp(end))]
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.55, 0.45], vertical_spacing=0.1,
@@ -77,6 +104,10 @@ def display_chart(daily: pd.DataFrame, weekly: pd.DataFrame, trades: pd.DataFram
         ("yield_pct_lower", "股息率下轨", "#14a389", "dash"),
     ]:
         fig.add_trace(go.Scatter(x=w.date, y=w[name], name=label, line=dict(color=color, dash=dash, width=1.6)), row=2, col=1)
+    for rule in grid:
+        fig.add_hline(y=rule.yield_pct, row=2, col=1, line_dash="dot", line_width=1.2,
+                      line_color="#059669" if rule.action == "BUY" else "#dc2626",
+                      annotation_text=rule.label(), annotation_position="top left", annotation_font_size=11)
     if not trades.empty:
         signal_to_week = w.set_index("date")
         for act, label, color, marker in [("BUY", "买入（信号周）", "#059669", "triangle-up"),
@@ -121,10 +152,14 @@ def stock_page():
                                        format="YYYY-MM-DD")
         st.header("2 · 策略")
         chosen = st.selectbox("买卖策略", list(STRATEGIES), format_func=lambda code: STRATEGIES[code])
+        grid = grid_editor() if chosen == "grid" else ()
         x_years = st.slider("股息率历史均线 X（年）", min_value=1, max_value=10, value=3)
         boll_weeks = st.slider("周线 Boll 周期（周）", min_value=5, max_value=60, value=20)
         sigma = st.slider("Boll 标准差倍数", min_value=1.0, max_value=3.5, value=2.0, step=0.25)
-        st.caption("默认策略：价格周线触及下轨 + 股息率高于过去 X 年均值 → 买；触及上轨 → 卖。仅持有多头，不做空。")
+        if chosen == "grid":
+            st.caption("网格策略中，X 年均线只用于图表参考；Boll 周期和倍数决定「周线」条件的上/中/下轨。")
+        else:
+            st.caption("默认策略：价格周线触及下轨 + 股息率高于过去 X 年均值 → 买；触及上轨 → 卖。仅持有多头，不做空。")
         st.header("3 · 资金与成本")
         initial_cash = st.number_input("初始资金（元）", min_value=10_000, max_value=100_000_000, value=100_000, step=10_000)
         commission_pct = st.number_input("交易佣金（单边 %，最低5元）", min_value=0.0, max_value=1.0, value=0.03, step=0.01, format="%.2f")
@@ -153,6 +188,10 @@ def stock_page():
         **④ 纯价格 Boll 周线策略**  
         不要求股息率高于均值，检验加入股息率条件后是否改善结果。
 
+        **⑤ 网格：股息率分档 + 周线 Boll**  
+        自定义多条规则分批买卖，例如：股息率 ≥ 5% 且周线 ≤ 下轨买入 50%；≥ 5.5% 且周线 ≤ 下轨再买 50%；
+        股息率 ≤ 4.5% 且周线 ≥ 上轨全部卖出。每个买入档在卖出前只成交一次；部分卖出时先卖最近买入的档。
+
         **回测模型**：使用周线末个交易日收盘信号，下一交易日开盘价执行；A 股买入手数为100股整数倍；计入手续费、滑点和卖出印花税。将现金分红和送转股纳入策略和买入持有对照。图中买卖点标识的是信号日期，交易表是实际成交日期。
         """)
         st.stop()
@@ -170,7 +209,7 @@ def stock_page():
     settings = Settings(strategy=chosen, lookback_years=x_years, boll_weeks=boll_weeks,
                         boll_sigma=sigma, initial_cash=float(initial_cash),
                         commission=commission_pct / 100, stamp_tax=stamp_pct / 100,
-                        slippage=slip_bps / 10_000)
+                        slippage=slip_bps / 10_000, **({"grid": grid} if chosen == "grid" else {}))
     # To create a full X-year weekly average and 1-year TTM yield even on the first
     # selected trading day, retrieve (X + 2) years of warm-up data first.
     fetch_start = max(date(1990, 1, 1), start_date - timedelta(days=(x_years + 2) * 366))
@@ -197,6 +236,10 @@ def stock_page():
         st.info(f"所选起点早于首个可用交易日，实际回测从 {view.date.iloc[0]:%Y-%m-%d} 开始。")
     if not view.empty and view.date.iloc[-1].date() < end_date:
         st.info(f"数据最新交易日是 {view.date.iloc[-1]:%Y-%m-%d}，并非设置的结束日期。")
+    if chosen == "grid" and not view.empty:
+        y = view.yield_pct.dropna()
+        st.caption(f"回测区间 TTM 股息率：最低 {y.min():.2f}% · 中位 {y.median():.2f}% · 最高 {y.max():.2f}% · "
+                   f"最新 {y.iloc[-1]:.2f}%（供设置网格阈值参考）")
 
     m = result.metrics
     cols = st.columns(5)
@@ -207,7 +250,7 @@ def stock_page():
     cols[4].metric("策略现金股息（税前）", f"¥{m['dividend_cash']:,.0f}")
 
     st.markdown("### 价格、股息率与买卖信号")
-    display_chart(daily, weekly, result.trades, start_date, end_date)
+    display_chart(daily, weekly, result.trades, start_date, end_date, grid)
 
     st.markdown("### 策略与买入持有对比")
     display_equity(result)
@@ -215,7 +258,10 @@ def stock_page():
     col1.metric("交易次数", f"{m['trade_count']} 次", help="买入和卖出分别算作一次")
     col2.metric("对照组合最大回撤", f"{m['benchmark_drawdown']:.2f}%")
     if m["trade_count"] == 0:
-        st.warning("该时间段没有满足条件的买入或卖出成交。可以缩短股息率均线 X 年周期、调低布林标准差，或更换策略。")
+        if chosen == "grid":
+            st.warning("该时间段没有满足网格规则的成交。可以对照下方股息率区间调整阈值，或把周线条件放宽为「≤中轨」/「不限」。")
+        else:
+            st.warning("该时间段没有满足条件的买入或卖出成交。可以缩短股息率均线 X 年周期、调低布林标准差，或更换策略。")
 
     st.markdown("### 交易记录与现金分红")
     tab1, tab2, tab3 = st.tabs(["买卖明细", "持仓收到的现金分红", "公司分红事件（已实施）"])
@@ -224,7 +270,8 @@ def stock_page():
             st.caption("无成交记录。")
         else:
             st.dataframe(result.trades.rename(columns={"signal_date": "信号日期", "date": "成交日期", "action": "方向",
-                                                       "price": "成交价（元）", "shares": "股数", "fee": "成本（元）", "cash_after": "剩余现金（元）"}),
+                                                       "rule": "规则", "price": "成交价（元）", "shares": "股数", "fee": "成本（元）",
+                                                       "cash_after": "剩余现金（元）", "shares_after": "成交后持股"}),
                          use_container_width=True, hide_index=True)
     with tab2:
         if result.cash_dividends.empty:

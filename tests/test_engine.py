@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from yieldbands.data import normalize_dividends, normalize_price, DataSourceError
-from yieldbands.engine import Settings, build_daily, build_weekly, backtest, conditions
+from yieldbands.engine import GridRule, Settings, build_daily, build_weekly, backtest, conditions
 
 
 def dividends(*events):
@@ -125,3 +125,46 @@ def test_normalize_prices_unadjusted_and_qfq_separately():
     out = normalize_price(raw, adj)
     assert out.close.tolist() == [10, 11]
     assert out.adj_close.tolist() == [8, 9]
+
+
+def _grid_case(weeks, grid):
+    """Flat 10-yuan prices; `weeks` lists (yield %, band) per Friday, band in {"low", "high", "mid"}."""
+    days = pd.bdate_range("2024-01-01", periods=5 * (len(weeks) + 1))
+    daily = build_daily(prices(*days, close=10), dividends(("2023-01-01", 0.1, 0.0)))
+    fridays = [d for d in days if d.weekday() == 4][:len(weeks)]
+    bands = {"low": (11, 15, 20), "high": (1, 3, 9), "mid": (5, 10, 15)}  # lower, mid, upper vs price 10
+    weekly = pd.DataFrame([{"date": f, "price": 10, "yield_pct": y,
+                            **dict(zip(("price_lower", "price_mid", "price_upper"), bands[b]))}
+                           for f, (y, b) in zip(fridays, weeks)])
+    s = Settings(strategy="grid", initial_cash=10000, commission=0, stamp_tax=0, slippage=0, grid=grid)
+    return backtest(daily, weekly, dividends(("2023-01-01", 0.1, 0.0)), days[0].date(), days[-1].date(), s)
+
+
+def test_grid_buys_each_level_once_and_sell_frees_levels():
+    grid = (GridRule("BUY", 5.0, "≤下轨", 50), GridRule("BUY", 5.5, "≤下轨", 50),
+            GridRule("SELL", 4.5, "≥上轨", 100))
+    weeks = [(5.2, "low"), (5.2, "low"), (5.6, "low"), (5.6, "mid"), (4.4, "high"), (5.2, "low")]
+    t = _grid_case(weeks, grid).trades
+    assert t.action.tolist() == ["BUY", "BUY", "SELL", "BUY"]
+    # a 5,000-yuan tranche buys 400 shares: 500 would exceed it with the 5-yuan minimum commission
+    assert t.shares.tolist() == [400, 400, 800, 400]
+    assert t.shares_after.tolist() == [400, 800, 0, 400]
+    # each fill is the Monday open after the signal Friday
+    assert all(t.date - t.signal_date == pd.Timedelta(days=3))
+
+
+def test_grid_yield_alone_does_not_buy_without_boll_condition():
+    grid = (GridRule("BUY", 5.0, "≤下轨", 50), GridRule("SELL", 4.5, "≥上轨", 100))
+    assert _grid_case([(6.0, "mid"), (6.0, "high")], grid).trades.empty
+
+
+def test_grid_partial_sell_releases_latest_level_first():
+    grid = (GridRule("BUY", 5.0, "不限", 50), GridRule("BUY", 5.5, "不限", 50),
+            GridRule("SELL", 4.8, "不限", 50), GridRule("SELL", 4.0, "不限", 100))
+    weeks = [(5.6, "mid"), (4.7, "mid"), (5.6, "mid"), (3.9, "mid")]
+    t = _grid_case(weeks, grid).trades
+    # both levels fill in one week; 50% sell frees level 2 only, which then refills;
+    # at 3.9% both sell rules match and the larger one (100%) wins
+    assert t.action.tolist() == ["BUY", "BUY", "SELL", "BUY", "SELL"]
+    assert t.shares_after.tolist() == [400, 800, 400, 800, 0]
+    assert t.rule.iloc[2] == "卖 股息率≤4.8%"
